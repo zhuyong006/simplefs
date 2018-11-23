@@ -23,7 +23,11 @@
  * such as: updating the free_blocks, inodes_count etc. */
 static DEFINE_MUTEX(simplefs_sb_lock);
 static DEFINE_MUTEX(simplefs_inodes_mgmt_lock);
-
+#if 0
+#define CDBG(fmt, args...) printk(fmt, ##args)
+#else
+#define CDBG(fmt, args...)
+#endif
 /* FIXME: This can be moved to an in-memory structure of the simplefs_inode.
  * Because of the global nature of this lock, we cannot create
  * new children (without locking) in two different dirs at a time.
@@ -34,11 +38,135 @@ static DEFINE_MUTEX(simplefs_inodes_mgmt_lock);
 static DEFINE_MUTEX(simplefs_directory_children_update_lock);
 
 static struct kmem_cache *sfs_inode_cachep;
+static struct kmem_cache *sfs_entry_cachep;
+
+/*代表目录中每一项的信息*/
+struct simplefs_cache_entry {
+	struct simplefs_dir_record record;
+	struct list_head list;
+	int entry_no;
+};
+
+/*代表整个目录*/
+struct simplefs_dir_cache {
+	uint64_t dir_children_count;
+	struct list_head used;
+	struct list_head free;
+};
+
+
+
+static struct simplefs_dir_cache *simplefs_cache_alloc(void)
+{
+    struct simplefs_dir_cache *dir_cache;
+    dir_cache = kzalloc(sizeof(struct simplefs_dir_cache), GFP_KERNEL);
+    if (!dir_cache)
+        return ERR_PTR(-ENOMEM);
+
+    INIT_LIST_HEAD(&dir_cache->free);
+    INIT_LIST_HEAD(&dir_cache->used);
+
+    return dir_cache;
+}
+
+/*         参数说明
+    dir_cache:
+    			  当前目录的缓存
+    bh:
+    			  磁盘中当前目录存放的实际信息
+ */
+
+
+static int dir_cache_build(struct simplefs_dir_cache *dir_cache, struct buffer_head *bh)
+{
+	struct simplefs_dir_record *record;
+	struct simplefs_cache_entry *cache_entry;
+	int i;
+
+	record = (struct simplefs_dir_record *)bh->b_data;
+
+	//SIMPLEFS_MAX_CHILDREN_CNT代表该目录最多可以支持创建的Inode总数
+	//因为目前项这个DATA_BLOCK中存放的都是simplefs_dir_record，因此最多存放数
+	//就是数据块大小/单个Entry的值
+	for (i = 0; i < SIMPLEFS_DEFAULT_BLOCK_SIZE/sizeof(struct simplefs_dir_record); i++, record++) {
+		//为目录中的每一项内容分配一个缓存
+		cache_entry = kmem_cache_alloc(sfs_entry_cachep, GFP_KERNEL);
+		if (!cache_entry)
+			return -ENOMEM;
+		//内容序号进行设置
+		cache_entry->entry_no = i;
+		
+		//Inode的编号是从1开始的，因此如果为0，说明该目录下的这个Inode已经释放
+		if (record->inode_no != 0) {
+			//如果不为0，插入到目录的缓存中的used链表中
+			memcpy(&cache_entry->record, record, sizeof(struct simplefs_dir_record));
+			list_add_tail(&cache_entry->list, &dir_cache->used);
+		} else {
+			//如果为0，则说明该Inode已经被释放，则插入到目录缓存的free链表中
+			list_add_tail(&cache_entry->list, &dir_cache->free);
+		}
+	}
+
+	return 0;
+}
+
+/*         参数说明
+    dir_cache:
+    			  当前目录的缓存
+    dentry:
+    			  需要查找的entry项
+ */
+static struct simplefs_cache_entry *used_cache_entry_get(struct simplefs_dir_cache *dir_cache,struct dentry *dentry)
+{
+	struct simplefs_cache_entry *cache_entry;
+
+	list_for_each_entry(cache_entry, &dir_cache->used, list) {
+		if (!strcmp(cache_entry->record.filename, dentry->d_name.name)) {
+			return cache_entry;
+		}
+	}
+
+	return NULL;
+}
+/*         参数说明
+    dir_cache:
+    			  当前目录的缓存
+    返回值:
+    			  从当前目录缓存中的free链表中,返回第一个空闲的元素
+    			  
+ */
+static struct simplefs_cache_entry *free_cache_entry_get(struct simplefs_dir_cache *dir_cache)
+{
+	return list_first_entry(&dir_cache->free, struct simplefs_cache_entry, list);
+}
+
+/*         参数说明
+    head:
+    			  目录缓存的链表头(used,free都有可能)
+    cache_entry:  即将插入used/free链表头的entry项
+    			  
+    			  
+ */
+
+static void cache_entry_insert(struct list_head *head, struct simplefs_cache_entry *cache_entry)
+{
+	struct simplefs_cache_entry *tmp_entry;
+	list_del(&cache_entry->list);
+
+	list_for_each_entry(tmp_entry, head, list) {
+		if (cache_entry->entry_no < tmp_entry->entry_no)
+			break;
+	}
+
+	list_add_tail(&cache_entry->list, &tmp_entry->list);
+}
+
+
 //同步超级块
 void simplefs_sb_sync(struct super_block *vsb)
 {
 	struct buffer_head *bh;
-	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb);
+	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb)->sb;
 	
 	bh = sb_bread(vsb, SIMPLEFS_SUPERBLOCK_BLOCK_NUMBER);
 	BUG_ON(!bh);
@@ -57,8 +185,9 @@ struct simplefs_inode *simplefs_inode_search(struct super_block *sb,
 		struct simplefs_inode *search)
 {
 	uint64_t count = 0;
-	while (start->inode_no != search->inode_no
-			&& count < SIMPLEFS_SB(sb)->inodes_count) {
+	//每个数据块是4K，这个数据块全部存放的是Inode，因此Inode的总数如下：
+	int icount = SIMPLEFS_DEFAULT_BLOCK_SIZE / sizeof(struct simplefs_inode);
+	while (start->inode_no != search->inode_no && count < icount) {
 		count++;
 		start++;
 	}
@@ -69,10 +198,18 @@ struct simplefs_inode *simplefs_inode_search(struct super_block *sb,
 
 	return NULL;
 }
+		
+/*         参数说明
+    vsb:
+    			  超级块
+    inode:
+    			  即将插入到Inode Block Data的inode
+    			  
+ */
 
 void simplefs_inode_add(struct super_block *vsb, struct simplefs_inode *inode)
 {
-	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb);
+	struct simplefs_sb_info *sb_info = SIMPLEFS_SB(vsb);
 	struct buffer_head *bh;
 	struct simplefs_inode *inode_iterator;
 
@@ -93,12 +230,14 @@ void simplefs_inode_add(struct super_block *vsb, struct simplefs_inode *inode)
 	}
 
 	/* Append the new inode in the end in the inode store */
-	/*先将inode_iterator指向空闲的Inode区域*/
-	inode_iterator += sb->inodes_count;
+	/*先将inode_iterator指向inode_no对应的存储区*/
+	inode_iterator += inode->inode_no-1;
 	//拷贝Inode信息到对应的位置
 	memcpy(inode_iterator, inode, sizeof(struct simplefs_inode));
-	//将超级块中的Inode计数自增
-	sb->inodes_count++;
+	//将超级块中的Inode总数计数自增
+	sb_info->sb->inodes_count++;
+	//将超级块中的Inode bitmap的对应位置位
+	set_bit(inode->inode_no, &sb_info->imap);
 
 	//先将当前的数据块标记为脏，等待回写磁盘
 	mark_buffer_dirty(bh);
@@ -120,10 +259,18 @@ void simplefs_inode_add(struct super_block *vsb, struct simplefs_inode *inode)
  * If for some reason, the file creation/deletion failed, the block number
  * will still be marked as non-free. You need fsck to fix this.*/
 // sb->free_blocks对应的Bit位如果为1，那么说明对应的数据块空闲，否则该数据块Busy
+
+/*         参数说明
+    vsb:
+    			  超级块
+    out:
+    			  即将返回的空闲数据块的索引
+    			  
+ */
 int simplefs_sb_get_a_freeblock(struct super_block *vsb, uint64_t * out)
 {
 	//通过内核标准的SuperBlock结构获取特定文件系统的SB结构
-	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb);
+	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb)->sb;
 	int i;
 	int ret = 0;
 
@@ -133,7 +280,7 @@ int simplefs_sb_get_a_freeblock(struct super_block *vsb, uint64_t * out)
 		goto end;
 	}
 
-	//需要注意的是，数据块是从第3个开始的，原因是根节点，超级块，以及块设备中存放的默认文件，本身已经在文件系统了
+	//需要注意的是，数据块是从第3个开始的，原因是超级块，inode信息区，根节点内容区，本身已经在文件系统了
 	// sb->free_blocks中的每一个Bit代表了一个数据块
 	/* Loop until we find a free block. We start the loop from 3,
 	 * as all prior blocks will always be in use */
@@ -167,10 +314,11 @@ end:
 	return ret;
 }
 
+/*返回当前文件系统中的Inode总数*/
 static int simplefs_sb_get_objects_count(struct super_block *vsb,
 					 uint64_t * out)
 {
-	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb);
+	struct simplefs_super_block *sb = SIMPLEFS_SB(vsb)->sb;
 
 	if (mutex_lock_interruptible(&simplefs_inodes_mgmt_lock)) {
 		sfs_trace("Failed to acquire mutex lock\n");
@@ -184,29 +332,54 @@ static int simplefs_sb_get_objects_count(struct super_block *vsb,
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0)
 /*这个函数在"ls"指令的时候会被调度到*/
+/*         参数说明
+    filp:
+    			  当前目录的文件指针
+    ctx:
+    			  显示上下文信息
+
+    说明：从当前目录的缓存中取出已使用的entry链表，逐个上报给vfs
+ */
 static int simplefs_iterate(struct file *filp, struct dir_context *ctx)
 #else
 static int simplefs_readdir(struct file *filp, void *dirent, filldir_t filldir)
 #endif
 {
 	loff_t pos;
-	struct inode *inode;
-	struct super_block *sb;
+	//通过目录的文件指针，获取目录结构
+	struct dentry *dentry = filp->f_path.dentry;
+	//获取当前目录的Inode
+	struct inode * parent_inode = dentry->d_inode;
+	//目录缓存指针
+	struct simplefs_dir_cache *dir_cache = NULL;
+	//临时变量，记录缓存中的每一个文件
+	struct simplefs_cache_entry *cache_entry;
+	//通过内核的inode指针获取特定文件系统的inode缓存指针
+	struct simplefs_inode *parent = SIMPLEFS_INODE(parent_inode);
 	struct buffer_head *bh;
-	struct simplefs_inode *sfs_inode;
-	struct simplefs_dir_record *record;
-	int i;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0)
+	CDBG("dentry inode no: %d\n",parent->inode_no);
+	
+	dir_cache = (struct simplefs_dir_cache *)dentry->d_fsdata;
+
+	//如果目录的缓存不存在，则为这个目录创建一个新的缓存
+	if (!dir_cache) {
+		CDBG("new simplefs_dir_cache\n");
+		//为当前的目录分配一个缓存
+		dir_cache = simplefs_cache_alloc();
+		if (IS_ERR(dentry->d_fsdata))
+		    return -EINVAL;
+		//从当前目录中获取信息
+		bh = sb_bread(parent_inode->i_sb, parent->data_block_number);
+		BUG_ON(!bh);
+		//为当前目录项的已用和空闲项创建链表索引
+		dir_cache_build(dir_cache, bh);
+		brelse(bh);
+	}
+	dentry->d_fsdata = dir_cache;
+
 	pos = ctx->pos;
-#else
-	pos = filp->f_pos;
-#endif
-	//通过文件从而获取到对应的Inode指针
-	inode = filp->f_dentry->d_inode;
-	//进一步的通过Inode获取到文件系统的SuperBlock
-	sb = inode->i_sb;
-	printk("%s LINE = %d\n",__func__,__LINE__);
+	
 	if (pos) {
 		/* FIXME: We use a hack of reading pos to figure if we have filled in all data.
 		 * We should probably fix this to work in a cursor based model and
@@ -214,39 +387,13 @@ static int simplefs_readdir(struct file *filp, void *dirent, filldir_t filldir)
 		return 0;
 	}
 
-	//通过内核标准的Inode从而获取到特定文件系统的Inode结构
-	sfs_inode = SIMPLEFS_INODE(inode);
-
-	//这个函数只会在目录下才能操作，因此不满足此条件则是非法
-	if (unlikely(!S_ISDIR(sfs_inode->mode))) {
-		printk(KERN_ERR
-		       "inode [%llu][%lu] for fs object [%s] not a directory\n",
-		       sfs_inode->inode_no, inode->i_ino,
-		       filp->f_dentry->d_name.name);
-		return -ENOTDIR;
-	}
-
-	//获取该目录下的内容指针
-	bh = sb_bread(sb, sfs_inode->data_block_number);
-	BUG_ON(!bh);
-	//目录下存放的内容都是simplefs_dir_record结构，强制转换一下
-	record = (struct simplefs_dir_record *)bh->b_data;
-	for (i = 0; i < sfs_inode->dir_children_count; i++) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0)
-		//逐一上报当前目录下的文件名
-		dir_emit(ctx, record->filename, SIMPLEFS_FILENAME_MAXLEN,
-			record->inode_no, DT_UNKNOWN);
+	list_for_each_entry(cache_entry, &dir_cache->used, list) {
+		dir_emit(ctx, cache_entry->record.filename, SIMPLEFS_FILENAME_MAXLEN,
+			cache_entry->record.inode_no, DT_UNKNOWN);		
 		ctx->pos += sizeof(struct simplefs_dir_record);
-#else
-		filldir(dirent, record->filename, SIMPLEFS_FILENAME_MAXLEN, pos,
-			record->inode_no, DT_UNKNOWN);
-		filp->f_pos += sizeof(struct simplefs_dir_record);
-#endif
 		pos += sizeof(struct simplefs_dir_record);
-		record++;
 	}
-	//释放数据块的指针
-	brelse(bh);
+
 
 	return 0;
 }
@@ -257,11 +404,9 @@ static int simplefs_readdir(struct file *filp, void *dirent, filldir_t filldir)
 struct simplefs_inode *simplefs_get_inode(struct super_block *sb,
 					  uint64_t inode_no)
 {
-	struct simplefs_super_block *sfs_sb = SIMPLEFS_SB(sb);
 	struct simplefs_inode *sfs_inode = NULL;
 	struct simplefs_inode *inode_buffer = NULL;
 
-	int i;
 	struct buffer_head *bh;
 
 	/* The inode store can be read once and kept in memory permanently while mounting.
@@ -272,26 +417,28 @@ struct simplefs_inode *simplefs_get_inode(struct super_block *sb,
 	BUG_ON(!bh);
 	//将其强制转换为simplefs_inode类型的指针
 	sfs_inode = (struct simplefs_inode *)bh->b_data;
-
-#if 0
+	
 	if (mutex_lock_interruptible(&simplefs_inodes_mgmt_lock)) {
 		printk(KERN_ERR "Failed to acquire mutex lock %s +%d\n",
 		       __FILE__, __LINE__);
 		return NULL;
 	}
-#endif
-	//根据指定的Inode索引获取Inode的相关信息，并返回
-	for (i = 0; i < sfs_sb->inodes_count; i++) {
-		if (sfs_inode->inode_no == inode_no) {
-			inode_buffer = kmem_cache_alloc(sfs_inode_cachep, GFP_KERNEL);
-			memcpy(inode_buffer, sfs_inode, sizeof(*inode_buffer));
 
-			break;
-		}
-		sfs_inode++;
+	if(inode_no == 0)
+	{
+		printk("%s invalid inode_no\n",__func__);
 	}
-//      mutex_unlock(&simplefs_inodes_mgmt_lock);
-
+	
+	//分配一个空闲的Inode缓存，并将磁盘中的Inode信息拷贝出来
+	inode_buffer = kmem_cache_alloc(sfs_inode_cachep, GFP_KERNEL);
+	//磁盘中Inode的信息区是按照顺序存放的
+	/*  
+	 *   super block 占用了1号Inode，其余的Inode依次排放
+	 */
+	sfs_inode += inode_no-1;
+	memcpy(inode_buffer, sfs_inode, sizeof(struct simplefs_inode));
+	
+	mutex_unlock(&simplefs_inodes_mgmt_lock);
 	brelse(bh);
 	return inode_buffer;
 }
@@ -364,7 +511,7 @@ int simplefs_inode_save(struct super_block *sb, struct simplefs_inode *sfs_inode
 	if (likely(inode_iterator)) {
 		/*更新Inode*/
 		memcpy(inode_iterator, sfs_inode, sizeof(*inode_iterator));
-		printk(KERN_INFO "The inode updated\n");
+		CDBG(KERN_INFO "The inode updated\n");
 		//将Inode的数据区设置为Dirty，并同步
 		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);
@@ -487,25 +634,43 @@ static int simplefs_create(struct inode *dir, struct dentry *dentry,
 
 static int simplefs_mkdir(struct inode *dir, struct dentry *dentry,
 			  umode_t mode);
+static int simplefs_unlink(struct inode *dir,struct dentry *dentry);
 
 static struct inode_operations simplefs_inode_ops = {
 	.create = simplefs_create,
 	.lookup = simplefs_lookup,
 	.mkdir = simplefs_mkdir,
+	.unlink = simplefs_unlink,
+	
 };
-
+/*
+ *        		函数参数说明
+ *    dir：    			当前所在目录的Inode
+ *    dentry:  			dentry->d_name.name:待创建的文件或者目录项
+ */
 static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 				     umode_t mode)
 {
 	struct inode *inode;
 	struct simplefs_inode *sfs_inode;
-	struct super_block *sb;
 	struct simplefs_inode *parent_dir_inode;
 	struct buffer_head *bh;
 	struct simplefs_dir_record *dir_contents_datablock;
 	uint64_t count;
 	int ret;
+	struct super_block *sb = dir->i_sb;
+	struct dentry *parent_dentry = dentry->d_parent;
+	struct simplefs_cache_entry *cache_entry;
+	struct simplefs_dir_cache * dir_cache;
+	struct simplefs_sb_info *sb_info = SIMPLEFS_SB(sb);
 
+
+	BUG_ON(parent_dentry->d_inode != dir);
+
+	dir_cache = (struct simplefs_dir_cache *)parent_dentry->d_fsdata;
+
+	BUG_ON(!dir_cache);
+	
 	if (mutex_lock_interruptible(&simplefs_directory_children_update_lock)) {
 		sfs_trace("Failed to acquire mutex lock\n");
 		return -EINTR;
@@ -544,14 +709,15 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 		mutex_unlock(&simplefs_directory_children_update_lock);
 		return -ENOMEM;
 	}
+	CDBG("sb imap inode no = %d\n",ffz(sb_info->imap));
 	//设置这个Inode指向的SuperBlock   
 	inode->i_sb = sb;
 	//设置这个Inode的操作指针
 	inode->i_op = &simplefs_inode_ops;
 	//设置这个Inode的创建时间
 	inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
-	//设置Inode的Inode号
-	inode->i_ino = (count + SIMPLEFS_START_INO - SIMPLEFS_RESERVED_INODES + 1);
+	//从超级块的inode map中取出第一个为0的索引号(Bit位)
+	inode->i_ino = ffz(sb_info->imap);
 	//创建特定文件系统的Inode结构
 	sfs_inode = kmem_cache_alloc(sfs_inode_cachep, GFP_KERNEL);
 	//对该节点的Inode号赋值
@@ -564,11 +730,11 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	//对文件目录以及普通文件分别做设置，需要注意的是，如果创建的是一个目录，那么毫无疑问，当前目录下
 	//的Inode个数肯定还是为0的
 	if (S_ISDIR(mode)) {
-		printk(KERN_INFO "New directory creation request\n");
+		CDBG(KERN_INFO "New directory creation request\n");
 		sfs_inode->dir_children_count = 0;
 		inode->i_fop = &simplefs_dir_operations;
 	} else if (S_ISREG(mode)) {
-		printk(KERN_INFO "New file creation request\n");
+		CDBG(KERN_INFO "New file creation request\n");
 		sfs_inode->file_size = 0;
 		//针对普通文件设置读写操作
 		inode->i_fop = &simplefs_file_operations;
@@ -591,6 +757,9 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	//新建一个Inode需要更新Inode的数据区，并同步
 	simplefs_inode_add(sb, sfs_inode);
 
+	/*从当前目录缓存中的free链表中取出一个空闲的entry项*/
+	cache_entry = free_cache_entry_get(dir_cache);
+
 	/*除了更新Inode的数据区，我们还需要做一件事:在父目录(Inode)下面，添加该Inode的信息*/
 	//既然要添加信息，必须首先取得当前父目录的结构信息，通过内核的标准Inode获取特定文件系统的Inode
 	//信息
@@ -602,11 +771,17 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	dir_contents_datablock = (struct simplefs_dir_record *)bh->b_data;
 
 	/* Navigate to the last record in the directory contents */
-	/*让DIR的内容指针指向空闲区域*/
-	dir_contents_datablock += parent_dir_inode->dir_children_count;
-	/*让DIR的内容inode_no以及文件名称更新到父目录中*/
+	/*需要注意的是父目录缓存中的entry也是按照顺序存放的，cache_entry->entry_no指向的
+      就是存放的序号，我们从free链表中取出的entry是紧跟在used后面的
+	*/
+	dir_contents_datablock += cache_entry->entry_no;
+	/*磁盘中的目录entry信息更新*/
 	dir_contents_datablock->inode_no = sfs_inode->inode_no;
 	strcpy(dir_contents_datablock->filename, dentry->d_name.name);
+	/*拷贝磁盘中目录单项存放的内容到entry的缓存中*/
+	memcpy(&cache_entry->record, dir_contents_datablock,sizeof(struct simplefs_dir_record));
+	/**/
+	cache_entry_insert(&dir_cache->used, cache_entry);
 
 	/*将父目录指向的数据块设置为dirty，并将其回写到磁盘，之后释放*/
 	mark_buffer_dirty(bh);
@@ -636,9 +811,14 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	mutex_unlock(&simplefs_directory_children_update_lock);
 	//将当前Inode和其父目录关联
 	inode_init_owner(inode, dir, mode);
-	//将当前文件加入到denrty下面
+	//将当前inode绑定到dentry中
 	d_add(dentry, inode);
 
+	return 0;
+}
+
+static int simplefs_unlink(struct inode *dir,struct dentry *dentry)
+{
 	return 0;
 }
 
@@ -648,99 +828,91 @@ static int simplefs_mkdir(struct inode *dir, struct dentry *dentry,
 	/* I believe this is a bug in the kernel, for some reason, the mkdir callback
 	 * does not get the S_IFDIR flag set. Even ext2 sets is explicitly */
 	 
-	printk("%s LINE = %d\n",__func__,__LINE__);
+	CDBG("%s LINE = %d\n",__func__,__LINE__);
 	return simplefs_create_fs_object(dir, dentry, S_IFDIR | mode);
 }
 
 static int simplefs_create(struct inode *dir, struct dentry *dentry,
 			   umode_t mode, bool excl)
 {
-	printk("%s LINE = %d\n",__func__,__LINE__);
+	CDBG("%s LINE = %d\n",__func__,__LINE__);
 
 	return simplefs_create_fs_object(dir, dentry, mode);
 }
-
+/*         参数说明
+    parent_inode:
+    			  当前目录的Inode
+    child_dentry:
+    			   当前查询的Inode,child_dentry->d_name.name可以获取名称
+    flags:
+    
+ */
 struct dentry *simplefs_lookup(struct inode *parent_inode,
 			       struct dentry *child_dentry, unsigned int flags)
 {
-	//从根节点的Inode获取在Mount的时候读取到的磁盘中Sb的信息
-	struct simplefs_inode *parent = SIMPLEFS_INODE(parent_inode);
 	struct super_block *sb = parent_inode->i_sb;
-	struct buffer_head *bh;
-	struct simplefs_dir_record *record;
-	int i;
-	//因为根节点中会包含Data Block的索引，通过这个索引获取根节点这个dentry中存放的内容
-	/*      根节点(Dentry)的内容如下:
-	 *      文件名:  "vanakkam"     
-	 *      Inode号:  2
-	 */
-	bh = sb_bread(sb, parent->data_block_number);
-	BUG_ON(!bh);
+	struct dentry *parent_dentry;
+	struct simplefs_dir_cache *dir_cache;
+	struct simplefs_cache_entry *cache_entry;
+	struct inode *inode;
+	struct simplefs_inode *sfs_inode;
 
-	//指向父目录Inode中内容头部
-	record = (struct simplefs_dir_record *)bh->b_data;
-	//先确定该目录下面有多少个Inode(这里是包含文件和目录的)
-	for (i = 0; i < parent->dir_children_count; i++) {
-		//如果遍历了整个目录后，都无法找到这个文件或者文件夹，那么直接返回NULL，让VFS为其新
-		//建一个Inode,child_dentry->d_name.name是希望创建的目标文件或者文件夹  
-		if (!strcmp(record->filename, child_dentry->d_name.name)) {
-			/* FIXME: There is a corner case where if an allocated inode,
-			 * is not written to the inode store, but the inodes_count is
-			 * incremented. Then if the random string on the disk matches
-			 * with the filename that we are comparing above, then we
-			 * will use an invalid uninitialized inode */
-			/*
-			 * 进入这个分支是一种比较极端的情况，意味着分配的Inode并没有被写入存储区，但是InodesCount确递增了
-			 * 同时磁盘上的Inode的随机字符串和我们比较的字符串匹配上了，那么我们直接使用这个非法的未初始化的
-			 * Inode即可
-			 */
-			struct inode *inode;
-			struct simplefs_inode *sfs_inode;
+	CDBG("%s LINE = %d,%s\n",__func__,__LINE__,
+		child_dentry->d_name.name);
+	
+	//得到父目录
+	parent_dentry = child_dentry->d_parent;
+	if(sb->s_root != parent_dentry)
+		CDBG("%s someting is wrong\n",__func__);
+	
+	if (parent_dentry->d_inode != parent_inode)
+		return ERR_PTR(-ENOENT);
+	
+	//得到父目录的私有数据: 目录Cache
+	dir_cache = (struct simplefs_dir_cache *)parent_dentry->d_fsdata;
+	
+	CDBG("%s LINE = %d\n",__func__,__LINE__);
 
-			//使用这个未被写入存储区的Inode号，查询到具体的Inode信息结构
-			sfs_inode = simplefs_get_inode(sb, record->inode_no);
-			//使用SuperBlock分配一个空闲的Inode
-			inode = new_inode(sb);
-			//设置Inode号
-			inode->i_ino = record->inode_no;
-			//设置这个Inode归属于哪个父节点(Inode)下，同时设置其模式(例如：表明其是目录还是文件)
-			inode_init_owner(inode, parent_inode, sfs_inode->mode);
-			//该Inode指向的超级块指针需要设置
-			inode->i_sb = sb;
-			//设置该Inode的节点操作指针(因为有可能这个节点它是一个目录，那就需要支持mkdir,touch等操作)
-			inode->i_op = &simplefs_inode_ops;
+	cache_entry = used_cache_entry_get(dir_cache, child_dentry);
+	if (!cache_entry)
+		goto out;
+	
+	CDBG("%s check inode_no = %d\n",__func__,cache_entry->record.inode_no);
 
-			//针对目录和常规文件的操作指针
-			if (S_ISDIR(inode->i_mode))
-				inode->i_fop = &simplefs_dir_operations;
-			else if (S_ISREG(inode->i_mode))
-				inode->i_fop = &simplefs_file_operations;
-			else
-				printk(KERN_ERR
-				       "Unknown inode type. Neither a directory nor a file");
 
-			/* FIXME: We should store these times to disk and retrieve them */
-			//设置Inode的创建时间
-			inode->i_atime = inode->i_mtime = inode->i_ctime =
-			    CURRENT_TIME;
 
-			//如前所述，i_private指针指向的是Inode具体信息(文件大小,属性,数据块的位置)
-			inode->i_private = sfs_inode;
+	sfs_inode = simplefs_get_inode(sb, cache_entry->record.inode_no);
+	if (!sfs_inode)
+		return ERR_PTR(-ENOENT);
 
-			//将该Inode加入到当前目录(Dentry)下
-			d_add(child_dentry, inode);
-			//由于我们使用的是之前分配的inode号(未写入存储区)，因此并不需要再重新创建了，直接
-			//返回NULL即可
-			return NULL;
-		}
-		record++;
-	}
+	
+	inode = new_inode(sb);
+	inode->i_ino = cache_entry->record.inode_no;
+	inode_init_owner(inode, parent_inode, sfs_inode->mode);
+	inode->i_sb = sb;
+	inode->i_op = &simplefs_inode_ops;
 
-	printk(KERN_ERR
+	if (S_ISDIR(inode->i_mode))
+		inode->i_fop = &simplefs_dir_operations;
+	else if (S_ISREG(inode->i_mode))
+		inode->i_fop = &simplefs_file_operations;
+	else
+		printk(KERN_ERR
+		       "Unknown inode type. Neither a directory nor a file");
+
+	/* FIXME: We should store these times to disk and retrieve them */
+	inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
+
+	inode->i_private = sfs_inode;
+
+	d_add(child_dentry, inode);
+	
+	CDBG(KERN_ERR
 	       "No inode found for the filename [%s]\n",
 	       child_dentry->d_name.name);
-
+out:
 	return NULL;
+
 }
 
 
@@ -760,6 +932,64 @@ static const struct super_operations simplefs_sops = {
 	.destroy_inode = simplefs_destory_inode,
 };
 
+static void simplefs_dentry_release(struct dentry *dentry)
+{
+	struct simplefs_dir_cache *dir_cache = dentry->d_fsdata;
+	struct simplefs_cache_entry *tmp, *cache_entry;
+
+	if (dir_cache) {
+		list_for_each_entry_safe(cache_entry, tmp, &dir_cache->free, list) {
+		list_del(&cache_entry->list);
+		kmem_cache_free(sfs_entry_cachep, cache_entry);
+		}
+
+		list_for_each_entry_safe(cache_entry, tmp, &dir_cache->used, list) {
+		list_del(&cache_entry->list);
+		kmem_cache_free(sfs_entry_cachep, cache_entry);
+		}
+	}
+
+	kfree(dir_cache);
+	dentry->d_fsdata = NULL;
+}
+
+static const struct dentry_operations simplefs_dentry_operations = {
+	.d_release = simplefs_dentry_release,
+};
+
+static void fill_imap(struct super_block *sb)
+{
+	int i;
+	struct simplefs_sb_info *sb_info = sb->s_fs_info;
+	struct simplefs_inode *simple_inode;
+	struct buffer_head *bh;
+	int icount = SIMPLEFS_DEFAULT_BLOCK_SIZE / sizeof(struct simplefs_inode);
+
+	bh = sb_bread(sb, SIMPLEFS_INODESTORE_BLOCK_NUMBER);
+	simple_inode = (struct simplefs_inode *)bh->b_data;
+	
+	CDBG("%s start,root inode = %d\n",__func__,simple_inode->inode_no);
+	CDBG("sb imap inode no = %d\n",ffz(sb_info->imap));
+
+	for (i = 0; i < SIMPLEFS_START_INO; i++)
+		set_bit(i, &sb_info->imap);
+
+	
+	for (i = SIMPLEFS_START_INO; i < icount; i++) {
+		if (simple_inode->inode_no != 0) {
+			printk("func %s, line %d, ino %lld\n", __func__, __LINE__, simple_inode->inode_no);
+			set_bit(simple_inode->inode_no, &sb_info->imap);
+		}
+		simple_inode++;
+	}
+	
+	CDBG("sb imap inode no = %d\n",ffz(sb_info->imap));
+	CDBG("%s end\n",__func__);
+
+	brelse(bh);
+}
+
+
 /* This function, as the name implies, Makes the super_block valid and
  * fills filesystem specific information in the super block */
 int simplefs_fill_super(struct super_block *sb, void *data, int silent)
@@ -767,12 +997,19 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	struct inode *root_inode;
 	struct buffer_head *bh;
 	struct simplefs_super_block *sb_disk;
+	struct simplefs_sb_info *sb_info;
 	int ret = -EPERM;
 
+	sb_info = kzalloc(sizeof(struct simplefs_sb_info),GFP_KERNEL);
 	bh = sb_bread(sb, SIMPLEFS_SUPERBLOCK_BLOCK_NUMBER);
 	BUG_ON(!bh);
 	//获取磁盘中存放的super block的真实内容
 	sb_disk = (struct simplefs_super_block *)bh->b_data;
+
+	//设置超级块缓存指向的内核sb的指针
+	sb_info->sb = sb_disk;
+	//设置超级块缓存指向的buffer_head
+	sb_info->bh = bh;
 
 	printk(KERN_INFO "The magic number obtained in disk is: [%llu]\n",
 	       sb_disk->magic);
@@ -798,12 +1035,16 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_magic = SIMPLEFS_MAGIC;
 
 	/* For all practical purposes, we will be using this s_fs_info as the super block */
-	//指向文件系统信息的数据结构，
-	sb->s_fs_info = sb_disk;
+	//使得内核的sb私有指针指向超级块的缓存
+	sb->s_fs_info = sb_info;
 	//表明当前文件系统最大数据块为4K
 	sb->s_maxbytes = SIMPLEFS_DEFAULT_BLOCK_SIZE;
 	//实现超级块的指针,不是必须实现的
 	sb->s_op = &simplefs_sops;
+	
+	sb->s_d_op = &simplefs_dentry_operations;
+	/*更新超级块缓存中存放的inode bitmap*/
+	fill_imap(sb);
 
 	//为我们的根节点分配一个Inode
 	root_inode = new_inode(sb);
@@ -836,6 +1077,7 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	root_inode->i_private =
 	    simplefs_get_inode(sb, SIMPLEFS_ROOTDIR_INODE_NUMBER);
 
+	
 	/* TODO: move such stuff into separate header. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 3, 0)
 	//Super Block需要告知当前文件系统的根dentry，而这个dentry本质上也是来自于一个inode
@@ -850,6 +1092,7 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 		ret = -ENOMEM;
 		goto release;
 	}
+
 
 	ret = 0;
 release:
@@ -877,12 +1120,16 @@ static struct dentry *simplefs_mount(struct file_system_type *fs_type,
 
 static void simplefs_kill_superblock(struct super_block *sb)
 {
+	struct simplefs_sb_info *sb_info = sb->s_fs_info;
+
 	printk(KERN_INFO
 	       "simplefs superblock is destroyed. Unmount succesful.\n");
 	/* This is just a dummy function as of now. As our filesystem gets matured,
 	 * we will do more meaningful operations here */
 
 	kill_block_super(sb);
+	//brelse(sb_info->bh);
+	kfree(sb_info);
 	return;
 }
 
@@ -904,7 +1151,18 @@ static int simplefs_init(void)
 	                                     0,
 	                                     (SLAB_RECLAIM_ACCOUNT| SLAB_MEM_SPREAD),
 	                                     NULL);
+	
+	sfs_entry_cachep = kmem_cache_create("sfs_entry_cachep",
+										sizeof(struct simplefs_cache_entry),
+										0,
+										(SLAB_RECLAIM_ACCOUNT| SLAB_MEM_SPREAD),
+										NULL);
+
 	if (!sfs_inode_cachep) {
+		return -ENOMEM;
+	}
+	
+	if (!sfs_entry_cachep) {
 		return -ENOMEM;
 	}
 

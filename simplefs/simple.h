@@ -11,13 +11,15 @@
 #define SIMPLEFS_MAGIC 0x10032013
 #define SIMPLEFS_DEFAULT_BLOCK_SIZE 4096
 #define SIMPLEFS_FILENAME_MAXLEN 255
-#define SIMPLEFS_START_INO 10
+#define SIMPLEFS_START_INO 1
+#define SIMPLEFS_ICOUNT 256
 /**
  * Reserver inodes for super block, inodestore
  * and datablock
  */
 #define SIMPLEFS_RESERVED_INODES 3
 
+#define SIMPLEFS_MAX_CHILDREN_CNT 64//(SIMPLEFS_DEFAULT_BLOCK_SIZE / sizeof(struct simplefs_dir_record))
 #ifdef SIMPLEFS_DEBUG
 #define sfs_trace(fmt, ...) {                       \
 	printk(KERN_ERR "[simplefs] %s +%d:" fmt,       \
@@ -82,4 +84,10 @@ struct simplefs_super_block {
 	uint64_t free_blocks;
 
 	char padding[SIMPLEFS_DEFAULT_BLOCK_SIZE - (5 * sizeof(uint64_t))];
+};
+
+struct simplefs_sb_info {
+	struct simplefs_super_block *sb;
+	unsigned long imap;
+	struct buffer_head *bh;
 };
