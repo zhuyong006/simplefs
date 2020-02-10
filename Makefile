@@ -6,3 +6,8 @@
 #
 
 obj-y				+= simplefs/
+obj-y				+= mm_spinlock/
+#Hook Just Only For X86
+#obj-y				+= hook/
+obj-y				+= globalfifo/
+obj-y				+= mm/

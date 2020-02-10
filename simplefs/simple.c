@@ -23,7 +23,7 @@
  * such as: updating the free_blocks, inodes_count etc. */
 static DEFINE_MUTEX(simplefs_sb_lock);
 static DEFINE_MUTEX(simplefs_inodes_mgmt_lock);
-#if 0
+#if 1
 #define CDBG(fmt, args...) printk(fmt, ##args)
 #else
 #define CDBG(fmt, args...)
@@ -250,6 +250,57 @@ void simplefs_inode_add(struct super_block *vsb, struct simplefs_inode *inode)
 	mutex_unlock(&simplefs_inodes_mgmt_lock);
 }
 
+/*         参数说明
+    vsb:
+    			  超级块
+    inode:
+    			  即将删除的Inode
+    			  
+ */
+
+void simplefs_inode_del(struct super_block *vsb, struct simplefs_inode *inode)
+{
+	struct simplefs_sb_info *sb_info = SIMPLEFS_SB(vsb);
+	struct buffer_head *bh;
+	struct simplefs_inode *inode_iterator;
+
+	if (mutex_lock_interruptible(&simplefs_inodes_mgmt_lock)) {
+		sfs_trace("Failed to acquire mutex lock\n");
+		return;
+	}
+
+	//存放Inode信息的数据区
+	bh = sb_bread(vsb, SIMPLEFS_INODESTORE_BLOCK_NUMBER);
+	BUG_ON(!bh);
+	//因为这个数据区依次存放的都是simplefs_inode的结构，因此做下强制转换
+	inode_iterator = (struct simplefs_inode *)bh->b_data;
+
+	if (mutex_lock_interruptible(&simplefs_sb_lock)) {
+		sfs_trace("Failed to acquire mutex lock\n");
+		return;
+	}
+
+	/* Append the new inode in the end in the inode store */
+	/*先将inode_iterator指向inode_no对应的存储区*/
+	inode_iterator += inode->inode_no-1;
+	//拷贝Inode信息到对应的位置
+	memset(inode_iterator, 0x0, sizeof(struct simplefs_inode));
+	//将超级块中的Inode总数计数自减
+	sb_info->sb->inodes_count--;
+	//将超级块中的Inode bitmap的对应位置位
+	clear_bit(inode->inode_no, &sb_info->imap);
+
+	//先将当前的数据块标记为脏，等待回写磁盘
+	mark_buffer_dirty(bh);
+	//同理超级块也需要更新
+	simplefs_sb_sync(vsb);
+	/*释放Inode的数据块*/
+	brelse(bh);
+
+	mutex_unlock(&simplefs_sb_lock);
+	mutex_unlock(&simplefs_inodes_mgmt_lock);
+}
+
 /* This function returns a blocknumber which is free.
  * The block will be removed from the freeblock list.
  *
@@ -358,7 +409,7 @@ static int simplefs_readdir(struct file *filp, void *dirent, filldir_t filldir)
 	struct simplefs_inode *parent = SIMPLEFS_INODE(parent_inode);
 	struct buffer_head *bh;
 
-	CDBG("dentry inode no: %d\n",parent->inode_no);
+	CDBG("dentry inode no: %d\n",parent_inode->i_ino);
 	
 	dir_cache = (struct simplefs_dir_cache *)dentry->d_fsdata;
 
@@ -433,7 +484,7 @@ struct simplefs_inode *simplefs_get_inode(struct super_block *sb,
 	inode_buffer = kmem_cache_alloc(sfs_inode_cachep, GFP_KERNEL);
 	//磁盘中Inode的信息区是按照顺序存放的
 	/*  
-	 *   super block 占用了1号Inode，其余的Inode依次排放
+	 *  根节点 占用了1号Inode，其余的Inode依次排放
 	 */
 	sfs_inode += inode_no-1;
 	memcpy(inode_buffer, sfs_inode, sizeof(struct simplefs_inode));
@@ -780,7 +831,7 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	strcpy(dir_contents_datablock->filename, dentry->d_name.name);
 	/*拷贝磁盘中目录单项存放的内容到entry的缓存中*/
 	memcpy(&cache_entry->record, dir_contents_datablock,sizeof(struct simplefs_dir_record));
-	/**/
+	/*将当前的cache_entry插入到used的链表中*/
 	cache_entry_insert(&dir_cache->used, cache_entry);
 
 	/*将父目录指向的数据块设置为dirty，并将其回写到磁盘，之后释放*/
@@ -817,8 +868,63 @@ static int simplefs_create_fs_object(struct inode *dir, struct dentry *dentry,
 	return 0;
 }
 
+/*
+ *        		函数参数说明
+ *    dir：    			当前所在目录的Inode
+ *    dentry:  			dentry->d_name.name:待删除的文件
+ */
 static int simplefs_unlink(struct inode *dir,struct dentry *dentry)
 {
+	struct inode *inode;
+	struct simplefs_inode *sfs_inode;
+	struct simplefs_inode *parent_dir_inode;
+	struct buffer_head *bh;
+	struct simplefs_dir_record *dir_contents_datablock;
+	uint64_t count;
+	int ret;
+	struct super_block *sb = dir->i_sb;
+	struct dentry *parent_dentry = dentry->d_parent;
+	struct simplefs_cache_entry *cache_entry;
+	struct simplefs_dir_cache * dir_cache;
+	struct simplefs_sb_info *sb_info = SIMPLEFS_SB(sb);
+
+	/*获取待删除文件对应该文件系统的inode缓存*/
+	sfs_inode = SIMPLEFS_INODE(dentry->d_inode);
+
+	dir_cache = (struct simplefs_dir_cache *)parent_dentry->d_fsdata;
+
+	/*将目录中对应的项清除*/
+	parent_dir_inode = SIMPLEFS_INODE(dir);
+	//通过simplefs_inode中的成员从而获取到数据信息
+	bh = sb_bread(sb, parent_dir_inode->data_block_number);
+	dir_contents_datablock = (struct simplefs_dir_record *)bh->b_data;
+	cache_entry = used_cache_entry_get(dir_cache,dentry);
+	dir_contents_datablock += cache_entry->entry_no;
+	memset(dir_contents_datablock,0x0,sizeof(struct simplefs_dir_record));
+	/*将父目录指向的数据块设置为dirty，并将其回写到磁盘，之后释放*/
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+
+	/*从当前目录的used链表中，删除当前的cache_entry*/
+	list_del(&cache_entry->list);
+	//将释放的cache_entry插入到当前目录的free链表中
+	list_add(&cache_entry->list,&dir_cache->free);
+	//将目录下的inode数减一
+	dir_cache->dir_children_count--;
+	//将父目录中的dir_children_count也自减
+	parent_dir_inode->dir_children_count--;
+	//同理我们更改了Inode数据区，这个数据区自然也要同步下了
+	ret = simplefs_inode_save(sb, parent_dir_inode);
+
+	//在Inode的存储区中，清除对应的Inode
+	simplefs_inode_del(sb,sfs_inode);
+
+	//释放内核的inode结构
+	__destroy_inode(dentry->d_inode);
+
+	dput(dentry);
+
 	return 0;
 }
 
@@ -862,8 +968,6 @@ struct dentry *simplefs_lookup(struct inode *parent_inode,
 	
 	//得到父目录
 	parent_dentry = child_dentry->d_parent;
-	if(sb->s_root != parent_dentry)
-		CDBG("%s someting is wrong\n",__func__);
 	
 	if (parent_dentry->d_inode != parent_inode)
 		return ERR_PTR(-ENOENT);
@@ -873,14 +977,16 @@ struct dentry *simplefs_lookup(struct inode *parent_inode,
 	
 	CDBG("%s LINE = %d\n",__func__,__LINE__);
 
+	//从目录cache中的used链表中找到，当前查询文件的cache_entry
 	cache_entry = used_cache_entry_get(dir_cache, child_dentry);
+
+	//如果cache_entry为空，说明该文件不在目录中，需要creat
 	if (!cache_entry)
 		goto out;
 	
 	CDBG("%s check inode_no = %d\n",__func__,cache_entry->record.inode_no);
 
-
-
+	
 	sfs_inode = simplefs_get_inode(sb, cache_entry->record.inode_no);
 	if (!sfs_inode)
 		return ERR_PTR(-ENOENT);
@@ -910,6 +1016,7 @@ struct dentry *simplefs_lookup(struct inode *parent_inode,
 	CDBG(KERN_ERR
 	       "No inode found for the filename [%s]\n",
 	       child_dentry->d_name.name);
+
 out:
 	return NULL;
 
@@ -971,10 +1078,11 @@ static void fill_imap(struct super_block *sb)
 	CDBG("%s start,root inode = %d\n",__func__,simple_inode->inode_no);
 	CDBG("sb imap inode no = %d\n",ffz(sb_info->imap));
 
+	/*第1个bit预留不用，因为root节点的序号是从1开始的*/
 	for (i = 0; i < SIMPLEFS_START_INO; i++)
 		set_bit(i, &sb_info->imap);
 
-	
+	/*从inode的元数据区中，逐个比对，将已经使用的inode在bitmap中标记*/
 	for (i = SIMPLEFS_START_INO; i < icount; i++) {
 		if (simple_inode->inode_no != 0) {
 			printk("func %s, line %d, ino %lld\n", __func__, __LINE__, simple_inode->inode_no);
@@ -1039,7 +1147,8 @@ int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_fs_info = sb_info;
 	//表明当前文件系统最大数据块为4K
 	sb->s_maxbytes = SIMPLEFS_DEFAULT_BLOCK_SIZE;
-	//实现超级块的指针,不是必须实现的
+	//实现Inode的destroy指针，当文件系统的文件被删除后，其对应的Inode缓存会被其
+	//函数指针的函数释放
 	sb->s_op = &simplefs_sops;
 	
 	sb->s_d_op = &simplefs_dentry_operations;
@@ -1192,5 +1301,5 @@ static void simplefs_exit(void)
 module_init(simplefs_init);
 module_exit(simplefs_exit);
 
-MODULE_LICENSE("CC0");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Sankar P");
